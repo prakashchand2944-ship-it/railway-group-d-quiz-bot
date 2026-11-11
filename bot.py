@@ -2,7 +2,6 @@ import os
 import json
 import sqlite3
 import asyncio
-import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,6 +12,11 @@ from google import genai
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+PORT = int(os.getenv("PORT", 10000))
+
+if not BOT_TOKEN or not GEMINI_API_KEY:
+    raise ValueError("BOT_TOKEN या GEMINI_API_KEY सेट नहीं है।")
 
 ai = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -43,25 +47,26 @@ SUBJECTS = [
     "सामान्य ज्ञान"
 ]
 
+
 async def generate_question(subject, topic=""):
     prompt = f"""
-    Railway Group D CEN के लिए हिंदी में एक MCQ बनाओ।
-    विषय: {subject}
-    टॉपिक: {topic or 'कोई भी परीक्षा उपयोगी टॉपिक'}
-    स्तर: 10वीं कक्षा और Group D परीक्षा।
+Railway Group D CEN के लिए हिंदी में एक MCQ बनाओ।
+विषय: {subject}
+टॉपिक: {topic or 'कोई भी परीक्षा उपयोगी टॉपिक'}
+स्तर: 10वीं कक्षा और Group D परीक्षा।
 
-    केवल JSON दो:
-    {{
-      "topic": "टॉपिक",
-      "question": "प्रश्न",
-      "A": "विकल्प A",
-      "B": "विकल्प B",
-      "C": "विकल्प C",
-      "D": "विकल्प D",
-      "answer": "A",
-      "explanation": "सरल हिंदी में व्याख्या"
-    }}
-    """
+केवल JSON दो:
+{{
+  "topic": "टॉपिक",
+  "question": "प्रश्न",
+  "A": "विकल्प A",
+  "B": "विकल्प B",
+  "C": "विकल्प C",
+  "D": "विकल्प D",
+  "answer": "A",
+  "explanation": "सरल हिंदी में व्याख्या"
+}}
+"""
 
     response = await asyncio.to_thread(
         ai.models.generate_content,
@@ -70,7 +75,19 @@ async def generate_question(subject, topic=""):
         config={"response_mime_type": "application/json"}
     )
 
-    return json.loads(response.text)
+    q = json.loads(response.text)
+
+    required = ["topic", "question", "A", "B", "C", "D", "answer", "explanation"]
+
+    if not all(key in q for key in required):
+        raise ValueError("प्रश्न का JSON अधूरा है।")
+
+    q["answer"] = q["answer"].upper()
+
+    if q["answer"] not in ["A", "B", "C", "D"]:
+        raise ValueError("सही उत्तर अमान्य है।")
+
+    return q
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -83,13 +100,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.commit()
 
     keyboard = [
-        [InlineKeyboardButton("📚 Maths", callback_data="subject:गणित"),
-         InlineKeyboardButton("🔬 Science", callback_data="subject:सामान्य विज्ञान")],
-        [InlineKeyboardButton("🧠 Reasoning", callback_data="subject:रीजनिंग"),
-         InlineKeyboardButton("🌍 GK", callback_data="subject:सामान्य ज्ञान")],
-        [InlineKeyboardButton("📊 My Score", callback_data="score"),
-         InlineKeyboardButton("🏆 Leaderboard", callback_data="top")],
-        [InlineKeyboardButton("🎯 Weak Topic Practice", callback_data="weak")]
+        [
+            InlineKeyboardButton("📚 Maths", callback_data="subject:गणित"),
+            InlineKeyboardButton("🔬 Science", callback_data="subject:सामान्य विज्ञान")
+        ],
+        [
+            InlineKeyboardButton("🧠 Reasoning", callback_data="subject:रीजनिंग"),
+            InlineKeyboardButton("🌍 GK", callback_data="subject:सामान्य ज्ञान")
+        ],
+        [
+            InlineKeyboardButton("📊 My Score", callback_data="score"),
+            InlineKeyboardButton("🏆 Leaderboard", callback_data="top")
+        ],
+        [
+            InlineKeyboardButton("🎯 Weak Topic Practice", callback_data="weak")
+        ]
     ]
 
     await update.message.reply_text(
@@ -101,13 +126,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_question(query, context, subject, topic=""):
-    await query.edit_message_text("⏳ AI आपके लिए प्रश्न तैयार कर रहा है...")
+    await query.edit_message_text(
+        "⏳ AI आपके लिए प्रश्न तैयार कर रहा है..."
+    )
 
     try:
         q = await generate_question(subject, topic)
 
         context.user_data["question"] = q
         context.user_data["subject"] = subject
+        context.user_data["answered"] = False
 
         keyboard = [
             [InlineKeyboardButton(f"A. {q['A']}", callback_data="answer:A")],
@@ -165,7 +193,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "weak":
         row = db.execute("""
-            SELECT subject, topic, COUNT(*) as total
+            SELECT subject, topic, COUNT(*) AS total
             FROM mistakes
             WHERE user_id=?
             GROUP BY subject, topic
@@ -184,12 +212,16 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("answer:"):
         q = context.user_data.get("question")
 
-        if not q:
-            await query.edit_message_text("कृपया नया Quiz शुरू करें।")
+        if not q or context.user_data.get("answered"):
+            await query.edit_message_text(
+                "इस प्रश्न का उत्तर पहले ही दिया जा चुका है। नया Quiz शुरू करें।"
+            )
             return
 
+        context.user_data["answered"] = True
+
         selected = data.split(":")[1]
-        correct = q["answer"].upper()
+        correct = q["answer"]
         subject = context.user_data["subject"]
 
         if selected == correct:
@@ -235,7 +267,14 @@ def main():
 
     print("Railway Group D Bot Started!")
 
-    app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{RENDER_URL}/{BOT_TOKEN}",
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
